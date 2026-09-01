@@ -88,6 +88,8 @@ export const READONLY_REFUSED_COMMANDS: Readonly<Record<string, string>> = {
     "this session can list role claims but cannot release one.",
   "worktree delete":
     "remove worktrees from Settings ▸ Worktrees, or run this from a full-surface session.",
+  "gemini run":
+    "this session can inspect Gemini CLI but cannot launch a coding agent that can edit a worktree.",
 };
 
 /**

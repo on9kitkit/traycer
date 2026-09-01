@@ -16,7 +16,29 @@ import { CLI_ERROR_CODES } from "../../runner/errors";
 // BEFORE the command body did anything, not merely that the body failed for
 // some other reason downstream.
 const mocks = vi.hoisted(() => ({
+  runGeminiRunCommandMock: vi.fn(async () => ({
+    binary: "gemini",
+    events: 0,
+    exitCode: 0,
+    malformedLines: 0,
+    model: null,
+    resultError: null,
+    sessionId: null,
+    signal: null,
+    status: "success" as const,
+    transcriptPath: null,
+    workingDirectory: "/tmp/gemini-worktree",
+  })),
   resolveHostAuthMock: vi.fn(async () => null),
+}));
+
+vi.mock("../../commands/gemini-run", () => ({
+  buildGeminiStatusCommand: () => async () => ({
+    data: null,
+    exitCode: 0,
+    human: null,
+  }),
+  runGeminiRunCommand: mocks.runGeminiRunCommandMock,
 }));
 
 vi.mock("../../internal/host-auth", () => ({
@@ -30,6 +52,7 @@ vi.mock("../../internal/host-auth", () => ({
 }));
 
 beforeEach(() => {
+  mocks.runGeminiRunCommandMock.mockClear();
   mocks.resolveHostAuthMock.mockClear();
 });
 
@@ -206,6 +229,12 @@ const REQUIRED_ARGS: Readonly<Record<string, readonly string[]>> = {
     "11111111-1111-4111-8111-111111111111",
   ],
   "worktree delete": ["--path", "/tmp/some-worktree"],
+  "gemini run": [
+    "--cwd",
+    "/tmp/gemini-worktree",
+    "--prompt",
+    "Inspect this worktree.",
+  ],
 };
 
 // Reads that stay runnable on the readonly surface: hidden from `--help`
@@ -251,11 +280,20 @@ describe("readonly-surface gate: refuses every table entry before the body runs"
         const program = buildProgramWithAgentRoles(true);
         const argv = [...commandPath.split(" "), ...REQUIRED_ARGS[commandPath]];
         const thrown = await parseAndCapture(program, argv);
-        expect(thrown).toMatchObject({ code: CLI_ERROR_CODES.FORBIDDEN });
+        if (commandPath === "gemini run") {
+          // Gemini owns a raw JSONL stream and therefore renders its own
+          // terminal error instead of throwing it through the regular
+          // runner. The proof of an early refusal is that no local Gemini
+          // preflight or process launch reaches its mocked command body.
+          expect(thrown).toBeNull();
+        } else {
+          expect(thrown).toMatchObject({ code: CLI_ERROR_CODES.FORBIDDEN });
+        }
         // The load-bearing assertion: the command body's own deepest
         // dependency was never reached, so the refusal happened ahead of it
         // rather than merely producing the same-looking error downstream.
         expect(mocks.resolveHostAuthMock).not.toHaveBeenCalled();
+        expect(mocks.runGeminiRunCommandMock).not.toHaveBeenCalled();
       });
     });
 
@@ -264,16 +302,17 @@ describe("readonly-surface gate: refuses every table entry before the body runs"
         const program = buildProgramWithAgentRoles(true);
         const argv = [...commandPath.split(" "), ...REQUIRED_ARGS[commandPath]];
         const thrown = await parseAndCapture(program, argv);
-        // Every gated command bottoms out in the mocked `resolveHostAuth`
-        // returning null, which throws AUTH_NO_CREDENTIALS - proof the body
-        // was reached rather than refused. Assert on "not E_FORBIDDEN" (per
-        // the task) rather than the exact code, so this stays robust to
-        // which specific downstream error a given command surfaces first.
-        expect(thrown).not.toBeNull();
-        expect(thrown).not.toMatchObject({ code: CLI_ERROR_CODES.FORBIDDEN });
-        // Positive proof: the body actually ran far enough to call its
-        // deepest dependency, not just "failed with a different code".
-        expect(mocks.resolveHostAuthMock).toHaveBeenCalled();
+        // Existing Host-backed commands bottom out in mocked `resolveHostAuth`.
+        // Gemini is intentionally local and runs no Host RPC, so its mocked
+        // runner is the corresponding proof that the body was reached.
+        if (commandPath === "gemini run") {
+          expect(thrown).toBeNull();
+          expect(mocks.runGeminiRunCommandMock).toHaveBeenCalled();
+        } else {
+          expect(thrown).not.toBeNull();
+          expect(thrown).not.toMatchObject({ code: CLI_ERROR_CODES.FORBIDDEN });
+          expect(mocks.resolveHostAuthMock).toHaveBeenCalled();
+        }
       });
     });
   }

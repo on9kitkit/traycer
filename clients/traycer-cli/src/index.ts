@@ -70,6 +70,10 @@ import { buildConfigShellRemoveCommand } from "./commands/config-shell-remove";
 import { configShellResetCommand } from "./commands/config-shell-reset";
 import { buildConfigShellRevertArgsCommand } from "./commands/config-shell-revert-args";
 import { buildConfigShellSetCommand } from "./commands/config-shell-set";
+import {
+  buildGeminiStatusCommand,
+  runGeminiRunCommand,
+} from "./commands/gemini-run";
 import { buildHostApplyCommand } from "./commands/host-apply";
 import { buildHostPurgeStageCommand } from "./commands/host-purge-stage";
 import { buildHostAvailableCommand } from "./commands/host-available";
@@ -107,7 +111,7 @@ import { serviceStartCommand } from "./commands/service-start";
 import { serviceStatusCommand } from "./commands/service-status";
 import { serviceUninstallCommand } from "./commands/service-uninstall";
 import { buildWhoamiCommand } from "./commands/whoami";
-import { CLI_ERROR_CODES, cliError } from "./runner/errors";
+import { CLI_ERROR_CODES, cliError, toCliError } from "./runner/errors";
 import { createCliLogger, errorFromUnknown, type ILogger } from "./logger";
 import {
   isRunningFromWellKnownSlot,
@@ -666,8 +670,124 @@ function registerCommands(program: Command, agentRolesEnabled: boolean): void {
   registerTerminalCommands(program);
   registerWorkspaceCommands(program);
   registerWorktreeCommands(program);
+  registerGeminiCommands(program);
   registerAgentCommands(program, agentRolesEnabled);
   registerMonitorCommand(program);
+}
+
+function registerGeminiCommands(program: Command): void {
+  const readonlyHidden = {
+    hidden: resolveAgentCliSurface(readonlyEnv()) === "readonly",
+  };
+  const gemini = program
+    .command("gemini")
+    .description(
+      "Inspect and run the locally installed Gemini CLI in an isolated Git worktree",
+    );
+
+  withRunner(
+    gemini
+      .command("status")
+      .description(
+        "Check whether Gemini CLI is executable without starting its interactive authentication flow",
+      )
+      .option(
+        "--binary <path>",
+        "Absolute Gemini CLI executable path (defaults to 'gemini' from PATH)",
+      ),
+    (opts) =>
+      buildGeminiStatusCommand({
+        binary: typeof opts.binary === "string" ? opts.binary : null,
+      }),
+  );
+
+  // This command intentionally bypasses `withRunner`: `--json` is a raw,
+  // forward-compatible Gemini JSONL stream rather than Traycer's normal
+  // terminal-envelope protocol. It must therefore enforce the readonly
+  // surface at this custom action boundary before doing any preflight I/O.
+  addRunnerFlags(
+    gemini
+      .command("run", readonlyHidden)
+      .description(
+        "Run Gemini CLI headlessly in one linked Git worktree, streaming its output while it edits and tests there",
+      )
+      .requiredOption(
+        "--cwd <path>",
+        "Absolute path to the linked Git worktree",
+      )
+      .requiredOption("--prompt <text>", "Task to send to Gemini CLI")
+      .option(
+        "--model <id>",
+        "Gemini model identifier to pass through unchanged to the installed CLI",
+      )
+      .option(
+        "--permission-mode <mode>",
+        "Gemini approval mode: default, plan, auto_edit, or yolo (defaults to default)",
+      )
+      .option("--resume <session>", "Resume a Gemini CLI session")
+      .option("--session-id <id>", "Use a supplied Gemini CLI session id")
+      .option(
+        "--skip-trust",
+        "Pass --skip-trust to Gemini CLI for a worktree you explicitly trust",
+      )
+      .option(
+        "--transcript <path>",
+        "Absolute path for an exact JSONL transcript copy",
+      )
+      .option(
+        "--binary <path>",
+        "Absolute Gemini CLI executable path (defaults to 'gemini' from PATH)",
+      )
+      .option(
+        "--allow-primary-worktree",
+        "Allow the primary checkout instead of requiring a linked worktree",
+      ),
+  ).action(async (...actionArgs: unknown[]) => {
+    const command = actionArgs[actionArgs.length - 1] as CommanderCommand;
+    const opts = command.optsWithGlobals() as Record<string, unknown>;
+    const json = opts.json === true;
+    try {
+      assertCommandAllowedOnSurface(
+        commanderCommandPath(command),
+        resolveAgentCliSurface(readonlyEnv()),
+      );
+      const result = await runGeminiRunCommand({
+        allowPrimaryWorktree: opts.allowPrimaryWorktree === true,
+        binary: typeof opts.binary === "string" ? opts.binary : null,
+        cwd: typeof opts.cwd === "string" ? opts.cwd : "",
+        json,
+        model: typeof opts.model === "string" ? opts.model : null,
+        permissionMode:
+          typeof opts.permissionMode === "string" ? opts.permissionMode : null,
+        prompt: typeof opts.prompt === "string" ? opts.prompt : "",
+        resume: typeof opts.resume === "string" ? opts.resume : null,
+        sessionId: typeof opts.sessionId === "string" ? opts.sessionId : null,
+        skipTrust: opts.skipTrust === true,
+        transcriptPath:
+          typeof opts.transcript === "string" ? opts.transcript : null,
+      });
+      await finishAndExit(result.exitCode);
+    } catch (error) {
+      const cliErr = toCliError(error);
+      if (json) {
+        writeStdout(
+          `${JSON.stringify({
+            type: "result",
+            status: "error",
+            error: {
+              code: cliErr.code,
+              message: cliErr.message,
+              details: cliErr.details,
+            },
+            timestamp: new Date().toISOString(),
+          })}\n`,
+        );
+      } else {
+        writeStderr(`error: ${cliErr.message} [code=${cliErr.code}]\n`);
+      }
+      await finishAndExit(cliErr.exitCode);
+    }
+  });
 }
 
 function registerAuthCommands(program: Command): void {
